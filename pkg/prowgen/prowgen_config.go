@@ -20,6 +20,12 @@ type Repository struct {
 	Images                []cioperatorapi.ProjectDirectoryImageBuildStepConfiguration `json:"images" yaml:"images"`
 	Tests                 []cioperatorapi.TestStepConfiguration                       `json:"tests" yaml:"tests"`
 	Resources             cioperatorapi.ResourceConfiguration                         `json:"resources" yaml:"resources"`
+	Flavors               Flavors                                                     `json:"flavors" yaml:"flavor"`
+}
+
+// Flavors represents flavors for OCP like aws, azure, gcp, aws-ovn, etc
+type Flavors struct {
+	All bool `json:"all" yaml:"all"`
 }
 
 type E2ETests struct {
@@ -47,6 +53,15 @@ type ReleaseBuildConfiguration struct {
 
 	Path   string
 	Branch string
+}
+
+func (rbc ReleaseBuildConfiguration) DeepCopy() ReleaseBuildConfiguration {
+	in := rbc.ReleaseBuildConfiguration.DeepCopy()
+	return ReleaseBuildConfiguration{
+		ReleaseBuildConfiguration: *in,
+		Path:                      rbc.Path,
+		Branch:                    rbc.Branch,
+	}
 }
 
 func NewGenerateConfigs(ctx context.Context, r Repository, cc CommonConfig, opts ...ReleaseBuildConfigurationOption) ([]ReleaseBuildConfiguration, error) {

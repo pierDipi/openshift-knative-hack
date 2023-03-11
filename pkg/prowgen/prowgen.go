@@ -19,13 +19,16 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/coreos/go-semver/semver"
 	gyaml "github.com/ghodss/yaml"
+	cioperatorapi "github.com/openshift/ci-tools/pkg/api"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v2"
 	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
 	prowconfig "k8s.io/test-infra/prow/config"
+	"k8s.io/utils/pointer"
 )
 
 // Config is the prowgen configuration file struct.
@@ -96,6 +99,8 @@ func Main() {
 				}
 			}
 
+			cfgs = addFlavors(repository, cfgs)
+
 			// Write generated configurations.
 			for _, cfg := range cfgs {
 				if err := saveReleaseBuildConfiguration(outConfig, cfg); err != nil {
@@ -132,6 +137,103 @@ func Main() {
 	}
 	if err := pushBranch(ctx, openShiftRelease, remote, "sync-serverless-ci", *inputConfig); err != nil {
 		log.Fatalln("Failed to push branch to openshift/release fork", *remote, err)
+	}
+}
+
+func addFlavors(repository Repository, cfgs []ReleaseBuildConfiguration) []ReleaseBuildConfiguration {
+	if !repository.Flavors.All {
+		return cfgs
+	}
+
+	out := make([]ReleaseBuildConfiguration, 0, len(cfgs))
+
+	for _, cfg := range cfgs {
+		out = append(out, cfg)
+		out = append(out, useFlavor(cfg, cioperatorapi.ClusterProfileAzure4))
+		out = append(out, useFlavor(cfg, cioperatorapi.ClusterProfileGCP))
+		out = append(out, useFlavor(cfg, cioperatorapi.ClusterProfileVSphere))
+		out = append(out, useFlavor(cfg, cioperatorapi.ClusterProfileOSDEphemeral))
+		out = append(out, useFlavor(cfg, cioperatorapi.ClusterProfileAWS))
+	}
+
+	return out
+}
+
+func useFlavor(cfg ReleaseBuildConfiguration, profile cioperatorapi.ClusterProfile) ReleaseBuildConfiguration {
+	cfg = cfg.DeepCopy()
+
+	tests := make([]cioperatorapi.TestStepConfiguration, 0, len(cfg.Tests))
+
+	variantSuffix := ""
+	for i := range cfg.Tests {
+		// Only add continuous tests to "flavor testing"
+		if cfg.Tests[i].Cron == nil {
+			continue
+		}
+
+		t := cfg.Tests[i].DeepCopy()
+		if t.Cron != nil && *t.Cron != "" {
+			variantSuffix = updateReleaseBuildConfigurationTestBasedOnFlavor(t, profile)
+			tests = append(tests, *t)
+		}
+	}
+
+	if variantSuffix != "" {
+		cfg.Metadata.Variant = fmt.Sprintf("%s-%s", cfg.Metadata.Variant, variantSuffix)
+		cfg.Path = appendVariantSuffixToPath(cfg.Path, variantSuffix)
+	}
+
+	cfg.Tests = tests
+
+	return cfg
+}
+
+func appendVariantSuffixToPath(path, variantSuffix string) string {
+	parts := strings.Split(path, ".")
+	extension := parts[len(parts)-1]
+	parts[len(parts)-1] = variantSuffix
+	parts = append(parts, extension)
+	return strings.Join(parts, "")
+}
+
+func updateReleaseBuildConfigurationTestBasedOnFlavor(t *cioperatorapi.TestStepConfiguration, profile cioperatorapi.ClusterProfile) string {
+	t.ClusterClaim = nil
+	t.MultiStageTestConfiguration.ClusterProfile = profile
+
+	switch profile {
+	case cioperatorapi.ClusterProfileAzure4:
+		t.MultiStageTestConfiguration.Workflow = pointer.String("openshift-e2e-azure")
+		t.As = strings.ReplaceAll(t.As, "aws", "azure")
+		return "azure"
+	case cioperatorapi.ClusterProfileGCP:
+		t.MultiStageTestConfiguration.Workflow = pointer.String("openshift-e2e-gcp")
+		t.As = strings.ReplaceAll(t.As, "aws", "gcp")
+		return "gcp"
+	case cioperatorapi.ClusterProfileVSphere:
+		t.MultiStageTestConfiguration.Workflow = pointer.String("openshift-e2e-vsphere-upi")
+		t.As = strings.ReplaceAll(t.As, "aws", "vsphere")
+		return "vsphere"
+	case cioperatorapi.ClusterProfileOSDEphemeral:
+		t.MultiStageTestConfiguration.Workflow = nil
+		t.As = strings.ReplaceAll(t.As, "aws", "osd")
+		pre := []cioperatorapi.TestStep{
+			{Reference: pointer.String("ipi-install-rbac")},
+			{Reference: pointer.String("osd-create-create")},
+		}
+		t.MultiStageTestConfiguration.Pre = append(pre, t.MultiStageTestConfiguration.Pre...)
+
+		post := []cioperatorapi.TestStep{
+			{Chain: pointer.String("gather")},
+			{Reference: pointer.String("osd-delete-delete")},
+		}
+		t.MultiStageTestConfiguration.Post = append(post, t.MultiStageTestConfiguration.Post...)
+		return "osd"
+	case cioperatorapi.ClusterProfileAWS:
+		t.MultiStageTestConfiguration.Workflow = pointer.String("openshift-e2e-aws-ovn")
+		t.As = strings.ReplaceAll(t.As, "aws", "aws-ovn")
+		return "aws-ovn"
+	default:
+		panic("unhandled cluster profile " + string(profile))
 	}
 }
 
