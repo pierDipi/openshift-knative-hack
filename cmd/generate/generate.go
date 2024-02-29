@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/parser"
@@ -11,16 +13,24 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"text/template"
 
+	devfileworkspaces "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
+	"github.com/devfile/api/v2/pkg/devfile"
+	devfilepdata "github.com/devfile/library/v2/pkg/devfile/parser/data"
+
+	gyaml "github.com/ghodss/yaml"
 	"github.com/spf13/pflag"
 	"go.uber.org/zap/buffer"
 	"golang.org/x/mod/modfile"
 	"gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/pointer"
+	kyaml "sigs.k8s.io/yaml"
 
 	"github.com/openshift-knative/hack/pkg/project"
 	"github.com/openshift-knative/hack/pkg/prowgen"
@@ -28,6 +38,7 @@ import (
 
 const (
 	GenerateDockerfileOption = "dockerfile"
+	GenerateDevfileOption    = "devfile"
 )
 
 //go:embed Dockerfile.template
@@ -45,11 +56,14 @@ func main() {
 		log.Fatal(err)
 	}
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
+	defer cancel()
+
 	var (
 		rootDir                      string
 		includes                     []string
 		excludes                     []string
-		generators                   string
+		generators                   []string
 		output                       string
 		dockerfilesDir               string
 		dockerfilesTestDir           string
@@ -60,6 +74,8 @@ func main() {
 		registryImageFmt             string
 		imagesFromRepositories       []string
 		imagesFromRepositoriesURLFmt string
+		openshiftReleaseIncludes     []string // example: "ci-operator/config/openshift-knative/serverless-operator/.*.yaml"
+		openshiftReleaseExcludes     []string
 	)
 
 	defaultIncludes := []string{
@@ -74,7 +90,7 @@ func main() {
 	pflag.StringVar(&rootDir, "root-dir", wd, "Root directory to start scanning, default to current working directory")
 	pflag.StringArrayVar(&includes, "includes", defaultIncludes, "File or directory regex to include")
 	pflag.StringArrayVar(&excludes, "excludes", defaultExcludes, "File or directory regex to exclude")
-	pflag.StringVar(&generators, "generators", "", "Generate something supported: [dockerfile]")
+	pflag.StringArrayVar(&generators, "generators", []string{}, "Generate something supported: [dockerfile, devfile]")
 	pflag.StringVar(&dockerfilesDir, "dockerfile-dir", "ci-operator/knative-images", "Dockerfiles output directory for project images relative to output flag")
 	pflag.StringVar(&dockerfilesBuildDir, "dockerfile-build-dir", "ci-operator/build-image", "Dockerfiles output directory for build image relative to output flag")
 	pflag.StringVar(&dockerfilesSourceDir, "dockerfile-source-dir", "ci-operator/source-image", "Dockerfiles output directory for source image relative to output flag")
@@ -85,6 +101,8 @@ func main() {
 	pflag.StringVar(&registryImageFmt, "registry-image-fmt", "registry.ci.openshift.org/openshift/%s:%s", "Container registry image format")
 	pflag.StringArrayVar(&imagesFromRepositories, "images-from", nil, "Additional image references to be pulled from other midstream repositories matching the tag in project.yaml")
 	pflag.StringVar(&imagesFromRepositoriesURLFmt, "images-from-url-format", "https://raw.githubusercontent.com/openshift-knative/%s/%s/openshift/images.yaml", "Additional images to be pulled from other midstream repositories matching the tag in project.yaml")
+	pflag.StringArrayVar(&openshiftReleaseIncludes, "openshift-release-includes", []string{}, "File or directory regex to include from the openshift/release repository")
+	pflag.StringArrayVar(&openshiftReleaseExcludes, "openshift-release-excludes", []string{}, "File or directory regex to exclude from the openshift/release repository")
 	pflag.Parse()
 
 	if rootDir == "" {
@@ -156,7 +174,8 @@ func main() {
 		log.Println("Main package path", p)
 	}
 
-	if generators == GenerateDockerfileOption {
+	generatorsSet := sets.New[string](generators...)
+	if generatorsSet.Has(GenerateDockerfileOption) {
 		goMod := getGoMod(rootDir)
 		goVersion := goMod.Go.Version
 
@@ -245,6 +264,165 @@ func main() {
 			log.Fatal("Write images mapping file ", err)
 		}
 	}
+
+	if generatorsSet.Has(GenerateDevfileOption) {
+		// Clone openshift/release and clean up existing jobs for the configured branches
+		openShiftRelease := prowgen.Repository{
+			Org:  "openshift",
+			Repo: "release",
+		}
+		if err := prowgen.InitializeOpenShiftReleaseRepository(ctx, openShiftRelease, &prowgen.Config{}, pointer.String("")); err != nil {
+			log.Fatal(err)
+		}
+
+		openshiftReleaseIncludesRegex := prowgen.ToRegexp(openshiftReleaseIncludes)
+		openshiftReleaseExcludesRegex := prowgen.ToRegexp(openshiftReleaseExcludes)
+
+		err := filepath.WalkDir(filepath.Join(openShiftRelease.RepositoryDirectory(), "ci-operator", "config", "openshift-knative"), func(path string, info fs.DirEntry, err error) error {
+			if info.IsDir() {
+				return nil
+			}
+
+			matchablePath, err := filepath.Rel(openShiftRelease.RepositoryDirectory(), path)
+			if err != nil {
+				return fmt.Errorf("failed to get relative path for %s (base path %s): %w", matchablePath, openShiftRelease.RepositoryDirectory(), err)
+			}
+
+			for _, i := range openshiftReleaseIncludesRegex {
+				if !i.MatchString(matchablePath) {
+					log.Println("Path", matchablePath, "doesn't match", i.String())
+					return nil
+				}
+				for _, x := range openshiftReleaseExcludesRegex {
+					if x.MatchString(matchablePath) {
+						log.Println("Path", matchablePath, "is excluded by", x.String())
+						return nil
+					}
+				}
+			}
+
+			log.Println("generating devfile for", matchablePath)
+
+			return generateDevfile(path)
+		})
+		if err != nil {
+			log.Fatalf("Failed while walking directory %q: %v\n", openShiftRelease.RepositoryDirectory(), err)
+		}
+	}
+}
+
+func generateDevfile(path string) error {
+	// Going directly from YAML raw input produces unexpected configs (due to missing YAML tags),
+	// so we convert YAML to JSON and unmarshal the struct from the JSON object.
+	y, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	j, err := gyaml.YAMLToJSON(y)
+	if err != nil {
+		return err
+	}
+
+	jobConfig := &prowgen.ReleaseBuildConfiguration{}
+	if err := json.Unmarshal(j, jobConfig); err != nil {
+		return err
+	}
+
+	data, err := devfilepdata.NewDevfileData("2.2.0")
+	if err != nil {
+		return fmt.Errorf("failed to create devfile data: %w", err)
+	}
+	data.SetSchemaVersion("2.2.0")
+	data.SetMetadata(devfile.DevfileMetadata{
+		Name:    fmt.Sprintf("%s-%s-%s", jobConfig.Metadata.Org, jobConfig.Metadata.Repo, jobConfig.Metadata.Branch),
+		Version: "2.2.0",
+	})
+
+	prj := devfileworkspaces.Project{
+		Name:      fmt.Sprintf("%s-%s-%s", jobConfig.Metadata.Org, jobConfig.Metadata.Repo, jobConfig.Metadata.Branch),
+		ClonePath: fmt.Sprintf("%s/%s/%s", jobConfig.Metadata.Org, jobConfig.Metadata.Repo, jobConfig.Metadata.Branch),
+		ProjectSource: devfileworkspaces.ProjectSource{
+			SourceType: devfileworkspaces.GitProjectSourceType,
+			Git: &devfileworkspaces.GitProjectSource{
+				GitLikeProjectSource: devfileworkspaces.GitLikeProjectSource{
+					CheckoutFrom: &devfileworkspaces.CheckoutFrom{
+						Revision: jobConfig.Metadata.Branch,
+						Remote:   "midstream",
+					},
+					Remotes: map[string]string{
+						"midstream": fmt.Sprintf("https://github.com/%s/%s.git", jobConfig.Metadata.Org, jobConfig.Metadata.Repo),
+					},
+				},
+			},
+		},
+	}
+
+	if err := data.AddProjects([]devfileworkspaces.Project{prj}); err != nil {
+		return fmt.Errorf("failed to add project %s: %w", prj.Name, err)
+	}
+
+	for _, i := range jobConfig.Images {
+		c := devfileworkspaces.Component{
+			Name:       string(i.To),
+			Attributes: nil,
+			ComponentUnion: devfileworkspaces.ComponentUnion{
+				ComponentType: devfileworkspaces.ImageComponentType,
+				Image: &devfileworkspaces.ImageComponent{
+					Image: devfileworkspaces.Image{
+						ImageName: string(i.To),
+						ImageUnion: devfileworkspaces.ImageUnion{
+							ImageType: devfileworkspaces.DockerfileImageType,
+							Dockerfile: &devfileworkspaces.DockerfileImage{
+								BaseImage: devfileworkspaces.BaseImage{},
+								DockerfileSrc: devfileworkspaces.DockerfileSrc{
+									SrcType: devfileworkspaces.UriLikeDockerfileSrcType,
+									Uri:     i.DockerfilePath,
+								},
+								Dockerfile: devfileworkspaces.Dockerfile{
+									BuildContext: ".",
+									Args:         []string{},
+									RootRequired: pointer.Bool(false),
+								},
+							},
+							AutoBuild: pointer.Bool(false),
+						},
+					},
+				},
+			},
+		}
+		if err := data.AddComponents([]devfileworkspaces.Component{c}); err != nil {
+			return fmt.Errorf("failed to add component image %s: %w", string(i.To), err)
+		}
+
+		command := devfileworkspaces.Command{
+			Id:         fmt.Sprintf("build-%s", string(i.To)),
+			Attributes: nil,
+			CommandUnion: devfileworkspaces.CommandUnion{
+				CommandType: devfileworkspaces.ApplyCommandType,
+				Exec:        nil,
+				Apply: &devfileworkspaces.ApplyCommand{
+					Component: c.Name,
+				},
+				Composite: nil,
+				Custom:    nil,
+			},
+		}
+
+		data.AddCommands([]devfileworkspaces.Command{command})
+	}
+
+	devfileBytes, err := kyaml.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal devfile to YAML")
+	}
+
+	fName := fmt.Sprintf("%s-%s-%s-devfile.yaml", jobConfig.Metadata.Org, jobConfig.Metadata.Repo, jobConfig.Metadata.Branch)
+	if err := os.WriteFile(fName, devfileBytes, os.ModePerm); err != nil {
+		return fmt.Errorf("failed to write fil")
+	}
+	log.Println(string(devfileBytes))
+
+	return nil
 }
 
 func getAdditionalImagesFromMatchingRepositories(repositories []string, metadata *project.Metadata, urlFmt string, mapping map[string]string) error {
