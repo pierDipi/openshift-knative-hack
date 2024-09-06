@@ -33,6 +33,9 @@ var PipelineRunTemplate embed.FS
 //go:embed docker-build.yaml
 var PipelineDockerBuildTemplate embed.FS
 
+//go:embed java-builder.yaml
+var PipelineJavaBuildTemplate embed.FS
+
 //go:embed fbc-builder.yaml
 var PipelineFBCBuildTemplate embed.FS
 
@@ -46,7 +49,8 @@ type Config struct {
 	Excludes       []string
 	ExcludesImages []string
 
-	FBCImages []string
+	FBCImages  []string
+	JavaImages []string
 
 	ResourcesOutputPathSkipRemove bool
 	ResourcesOutputPath           string
@@ -62,6 +66,7 @@ type Config struct {
 
 func Generate(cfg Config) error {
 	fbcBuildPipelinePath := filepath.Join(cfg.PipelinesOutputPath, "fbc-builder.yaml")
+	javaBuildPipelinePath := filepath.Join(cfg.PipelinesOutputPath, "java-builder.yaml")
 	containerBuildPipelinePath := filepath.Join(cfg.PipelinesOutputPath, "docker-build.yaml")
 
 	if cfg.ComponentNameFunc == nil {
@@ -107,6 +112,10 @@ func Generate(cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to create regular expressions for %+v: %w", cfg.FBCImages, err)
 	}
+	javaImages, err := toRegexp(cfg.JavaImages)
+	if err != nil {
+		return fmt.Errorf("failed to create regular expressions for %+v: %w", cfg.FBCImages, err)
+	}
 
 	configs, err := collectConfigurations(cfg.OpenShiftReleasePath, includes, excludes)
 	if err != nil {
@@ -141,6 +150,10 @@ func Generate(cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse pipeline run push template: %w", err)
 	}
+	pipelineJavaBuildTemplate, err := template.New("java-builder.yaml").Delims("{{{", "}}}").Funcs(funcs).ParseFS(PipelineJavaBuildTemplate, "*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to parse pipeline run push template: %w", err)
+	}
 	pipelineFBCBuildTemplate, err := template.New("fbc-builder.yaml").Delims("{{{", "}}}").Funcs(funcs).ParseFS(PipelineFBCBuildTemplate, "*.yaml")
 	if err != nil {
 		return fmt.Errorf("failed to parse pipeline run push template: %w", err)
@@ -171,6 +184,12 @@ func Generate(cfg Config) error {
 			for _, r := range fbcImages {
 				if r.MatchString(string(ib.To)) {
 					pipeline = FBCBuild
+					break
+				}
+			}
+			for _, r := range javaImages {
+				if r.MatchString(string(ib.To)) {
+					pipeline = JavaBuild
 					break
 				}
 			}
@@ -275,6 +294,16 @@ func Generate(cfg Config) error {
 				}
 
 			}
+			if config.Pipeline == JavaBuild {
+
+				if err := pipelineJavaBuildTemplate.Execute(buf, nil); err != nil {
+					return fmt.Errorf("failed to execute template for pipeline %q: %w", javaBuildPipelinePath, err)
+				}
+				if err := WriteFileReplacingNewerTaskImages(javaBuildPipelinePath, buf.Bytes(), 0777); err != nil {
+					return fmt.Errorf("failed to write FBC build pipeline file %q: %w", javaBuildPipelinePath, err)
+				}
+
+			}
 		}
 	}
 
@@ -371,6 +400,7 @@ type Pipeline string
 const (
 	DockerBuild Pipeline = "docker-build"
 	FBCBuild    Pipeline = "fbc-builder"
+	JavaBuild   Pipeline = "java-builder"
 )
 
 func parseConfig(path string) (*cioperatorapi.ReleaseBuildConfiguration, error) {

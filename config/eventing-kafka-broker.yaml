@@ -3,6 +3,8 @@ config:
     release-next:
       konflux:
         enabled: true
+        javaImages:
+        - .*eventing-kafka-broker-(receiver|dispatcher).*
       openShiftVersions:
       - version: "4.15"
       - onDemand: true

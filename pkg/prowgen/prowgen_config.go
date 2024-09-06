@@ -85,7 +85,8 @@ type Konflux struct {
 	Excludes       []string `json:"excludes,omitempty" yaml:"excludes,omitempty"`
 	ExcludesImages []string `json:"excludesImages,omitempty" yaml:"excludesImages,omitempty"`
 
-	FBCImages []string `json:"fbcImages,omitempty" yaml:"fbcImages,omitempty"`
+	FBCImages  []string `json:"fbcImages,omitempty" yaml:"fbcImages,omitempty"`
+	JavaImages []string `json:"javaImages" yaml:"javaImages"`
 }
 
 type OpenShift struct {
