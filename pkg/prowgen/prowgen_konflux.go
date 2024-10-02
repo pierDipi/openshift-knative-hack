@@ -54,12 +54,13 @@ func GenerateKonflux(ctx context.Context, openshiftRelease Repository, configs [
 						soVersion := soversion.FromUpstreamVersion(branchName)
 
 						if r.Org == "openshift-knative" && r.Repo == "kn-plugin-func" {
-							// functions is one minor ahead the others (with client 1.15 comes func 1.16)
-							soVersion.Minor--
-							soBranchName = soversion.BranchName(soVersion)
-						} else {
-							soBranchName = soversion.BranchName(soVersion)
+							if soVersion.Major == 1 && soVersion.Minor < 35 {
+								// functions is one minor ahead the others for versions previous to
+								// 1.35
+								soVersion.Minor--
+							}
 						}
+						soBranchName = soversion.BranchName(soVersion)
 					}
 
 					// Checkout s-o to get the right release version from project.yaml (e.g. 1.34.1)
