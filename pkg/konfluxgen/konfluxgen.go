@@ -15,6 +15,7 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/openshift-knative/hack/pkg/comet"
 	"github.com/openshift-knative/hack/pkg/soversion"
 	"github.com/openshift-knative/hack/pkg/util"
 
@@ -93,6 +94,8 @@ type Config struct {
 
 	ClusterServiceVersionPath  string
 	AdditionalComponentConfigs []TemplateConfig
+
+	CometFilePath string
 }
 
 type PrefetchDeps struct {
@@ -315,6 +318,13 @@ func Generate(cfg Config) error {
 
 		for componentKey, config := range components {
 			buf := &bytes.Buffer{}
+
+			if cfg.CometFilePath != "" {
+				err := persistCometMapping(cfg, config)
+				if err != nil {
+					return err
+				}
+			}
 
 			appPath := filepath.Join(cfg.ResourcesOutputPath, ApplicationsDirectoryName, appKey, fmt.Sprintf("%s.yaml", appKey))
 			if err := os.MkdirAll(filepath.Dir(appPath), 0777); err != nil {
@@ -879,6 +889,7 @@ func executeComponentReleasePlanAdmissionTemplate(data rpaComponentData, outputF
 type ComponentImageRepoRef struct {
 	ComponentName   string
 	ImageRepository string
+	Image           string
 }
 
 func getComponentImageRefs(csv *operatorsv1alpha1.ClusterServiceVersion) ([]ComponentImageRepoRef, error) {
@@ -905,6 +916,7 @@ func getComponentImageRefs(csv *operatorsv1alpha1.ClusterServiceVersion) ([]Comp
 		refs = append(refs, ComponentImageRepoRef{
 			ComponentName:   componentName,
 			ImageRepository: repoRef,
+			Image:           relatedImage.Image,
 		})
 	}
 
@@ -927,4 +939,24 @@ func loadClusterServiceVerion(path string) (*operatorsv1alpha1.ClusterServiceVer
 		return nil, fmt.Errorf("failed to unmarshall CSV: %w", err)
 	}
 	return csv, nil
+}
+
+func persistCometMapping(cfg Config, config DockerfileApplicationConfig) error {
+	repo := fmt.Sprintf("%s/%s", Truncate(Sanitize(config.ApplicationName)), Truncate(Sanitize(config.ProjectDirectoryImageBuildStepConfiguration.To)))
+	cmt, err := comet.GuessComet(comet.Guess{
+		FilePath:    cfg.CometFilePath,
+		RHELVersion: comet.RHEL8,
+		Image:       repo,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to guess comet mapping: %w", err)
+	}
+	err = comet.Persist(cfg.CometFilePath, cmt.To, comet.Component{
+		Name: config.ComponentName,
+		Repo: repo,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to persist comet mapping for %q: %w", config.ComponentName, err)
+	}
+	return nil
 }
