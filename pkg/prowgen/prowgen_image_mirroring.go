@@ -6,8 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/coreos/go-semver/semver"
 	cioperatorapi "github.com/openshift/ci-tools/pkg/api"
 	"k8s.io/apimachinery/pkg/util/sets"
+
+	"github.com/openshift-knative/hack/pkg/soversion"
 )
 
 type ImageMirroringConfig struct {
@@ -27,6 +30,9 @@ const (
 	ImageMirroringConfigPath       = "core-services/image-mirroring/knative"
 	ImageMirroringConfigFilePrefix = "mapping_knative"
 )
+
+// Migration to Konflux version. We don't need mirroring anymore.
+var stopMirroringVersion = semver.New("1.35.0")
 
 func GenerateImageMirroringConfigs(openshiftRelease Repository, cfgs []ReleaseBuildConfiguration) []ImageMirroringConfig {
 	mirroringConfigs := make([]ImageMirroringConfig, 0, 8)
@@ -50,7 +56,21 @@ func GenerateImageMirroringConfigs(openshiftRelease Repository, cfgs []ReleaseBu
 				}
 			}
 
-			if lines.Len() == 0 {
+			repo := Repository{
+				Org:  cfg.Metadata.Org,
+				Repo: cfg.Metadata.Repo,
+			}
+			var v *semver.Version
+			if repo.IsServerlessOperator() {
+				v = soversion.FromUpstreamVersion(soversion.ToUpstreamVersion(release).String())
+			} else {
+				v = soversion.FromUpstreamVersion(release)
+			}
+			if stopMirroringVersion.Compare(*v) <= 0 /* less or equal to */ {
+				release = ""
+			}
+
+			if lines.Len() == 0 || release == "" {
 				continue
 			}
 

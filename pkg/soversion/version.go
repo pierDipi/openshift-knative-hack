@@ -17,9 +17,7 @@ func FromUpstreamVersion(upstream string) *semver.Version {
 		upstream = upstream + ".0"
 	}
 	soVersion := semver.New(upstream)
-	for i := 0; i < 21; i++ { // Example 1.11 -> 1.32
-		soVersion.BumpMinor()
-	}
+	soVersion.Minor += 21
 
 	upstreamVersion := semver.New(upstream)
 	if upstreamVersion.Compare(*semver.New("1.13.0")) >= 0 {
@@ -33,6 +31,10 @@ func FromUpstreamVersion(upstream string) *semver.Version {
 }
 
 func ToUpstreamVersion(soversion string) *semver.Version {
+	soversion = strings.Replace(soversion, "knative-v", "", 1)
+	soversion = strings.Replace(soversion, "knative-", "", 1)
+	soversion = strings.Replace(soversion, "release-v", "", 1)
+	soversion = strings.Replace(soversion, "release-", "", 1)
 	soversion = strings.Replace(soversion, "serverless-v", "", 1)
 	soversion = strings.Replace(soversion, "serverless-", "", 1)
 	soversion = strings.Replace(soversion, "v", "", 1)
@@ -42,10 +44,7 @@ func ToUpstreamVersion(soversion string) *semver.Version {
 		soversion = soversion + ".0"
 	}
 	upstreamVersion := semver.New(soversion)
-	upstreamVersion.Patch = 0
-	for i := 0; i < 21; i++ { // Example 1.32 -> 1.11
-		upstreamVersion.Minor--
-	}
+	upstreamVersion.Minor -= 21
 
 	soVersion := semver.New(soversion)
 	if soVersion.Compare(*semver.New("1.34.0")) >= 0 { //so >= xy
